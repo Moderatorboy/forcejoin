@@ -1,19 +1,8 @@
-"""
-Telegram Bot - Force Subscribe + Self Ping (No Sleep)
-======================================================
-Bot khud apne aap ko har 14 minute mein ping karta hai
-taaki Render free plan pe sleep na ho.
-
-Render Environment Variables:
-  BOT_TOKEN    = your_bot_token
-  WEBHOOK_URL  = https://yourapp.onrender.com
-  CHANNELS     = @ch1|https://t.me/ch1|Channel 1,@ch2|https://t.me/ch2|Channel 2
-"""
-
 import os
 import asyncio
 import logging
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
@@ -29,7 +18,6 @@ from telegram.ext import (
 from telegram.error import TelegramError
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -37,15 +25,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]   # e.g. https://yourapp.onrender.com
+# Environment variables ko safely load karna
+BOT_TOKEN   = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT        = int(os.environ.get("PORT", 8443))
-PING_PORT   = 8080   # Health check server ka port
-PING_INTERVAL = 14 * 60  # 14 minutes (Render 15 min pe sleep karta hai)
+PING_PORT   = 8080
+PING_INTERVAL = 14 * 60 
 
 def load_channels() -> list[dict]:
     raw = os.environ.get("CHANNELS", "")
+    if not raw:
+        logger.error("ERROR: CHANNELS environment variable missing hai!")
+        return []
+    
     channels = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -53,54 +45,50 @@ def load_channels() -> list[dict]:
             continue
         parts = entry.split("|")
         if len(parts) != 3:
-            logger.warning(f"Invalid channel entry (skip): '{entry}'")
+            logger.warning(f"Invalid format skipped: '{entry}' (Format '@id|link|name' hona chahiye)")
             continue
         username, link, name = [p.strip() for p in parts]
         channels.append({"username": username, "link": link, "name": name})
-    if not channels:
-        raise ValueError("CHANNELS env variable set nahi hai ya format galat hai.")
-    logger.info(f"{len(channels)} channel(s) loaded: {[c['username'] for c in channels]}")
+    
     return channels
 
 CHANNELS = load_channels()
 
-# ─── SELF PING ────────────────────────────────────────────────────────────────
-
+# ─── SELF PING (RENDER NO-SLEEP) ─────────────────────────────────────────────
 class PingHandler(BaseHTTPRequestHandler):
-    """Simple HTTP server — Render aur self-pinger dono ke liye."""
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"OK")
+        self.wfile.write(b"Bot is Active")
 
     def log_message(self, format, *args):
-        pass  # HTTP logs suppress karo
+        pass 
 
 def start_health_server():
-    """Background mein ek simple HTTP server chalao."""
-    server = HTTPServer(("0.0.0.0", PING_PORT), PingHandler)
-    logger.info(f"Health server port {PING_PORT} pe start hua")
-    server.serve_forever()
+    try:
+        server = HTTPServer(("0.0.0.0", PING_PORT), PingHandler)
+        logger.info(f"Health server started on port {PING_PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Health server failed: {e}")
 
 def self_ping_loop():
-    """Har 14 minute mein apne aap ko ping karo."""
-    ping_url = f"http://localhost:{PING_PORT}"
+    # Render ko jagaaye rakhne ke liye external URL ping karna behtar hai
+    url = WEBHOOK_URL if WEBHOOK_URL else f"http://localhost:{PING_PORT}"
+    time.sleep(20) # Startup delay
     while True:
         try:
-            r = requests.get(ping_url, timeout=10)
-            logger.info(f"Self ping OK ({r.status_code})")
+            r = requests.get(url, timeout=10)
+            logger.info(f"Self-ping sent to {url} - Status: {r.status_code}")
         except Exception as e:
-            logger.warning(f"Self ping failed: {e}")
-        import time
+            logger.warning(f"Self-ping failed: {e}")
         time.sleep(PING_INTERVAL)
 
 def start_pinger():
-    """Health server + pinger dono alag threads mein chalao."""
     threading.Thread(target=start_health_server, daemon=True).start()
-    threading.Thread(target=self_ping_loop,      daemon=True).start()
+    threading.Thread(target=self_ping_loop, daemon=True).start()
 
 # ─── SUBSCRIPTION CHECK ──────────────────────────────────────────────────────
-
 async def get_unjoined(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> list:
     unjoined = []
     for ch in CHANNELS:
@@ -108,115 +96,67 @@ async def get_unjoined(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> list
             member = await context.bot.get_chat_member(ch["username"], user_id)
             if member.status not in ("member", "administrator", "creator"):
                 unjoined.append(ch)
-        except TelegramError as e:
-            logger.warning(f"{ch['username']} check failed: {e}")
+        except Exception as e:
+            logger.error(f"Membership check failed for {ch['username']}: {e}")
             unjoined.append(ch)
     return unjoined
 
 def join_keyboard(unjoined: list) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(f"📢 {ch['name']} Join Karo", url=ch["link"])]
-        for ch in unjoined
-    ]
-    buttons.append(
-        [InlineKeyboardButton("✅ Sab join kar liya — Verify karo", callback_data="verify")]
-    )
+    buttons = [[InlineKeyboardButton(f"📢 Join {ch['name']}", url=ch["link"])] for ch in unjoined]
+    buttons.append([InlineKeyboardButton("✅ Verify Karo", callback_data="verify")])
     return InlineKeyboardMarkup(buttons)
 
-async def prompt(update: Update, unjoined: list) -> None:
-    total     = len(CHANNELS)
-    remaining = len(unjoined)
-    joined    = total - remaining
-    ch_list   = "\n".join(f"  ❌  {ch['name']}  ({ch['username']})" for ch in unjoined)
-    await update.effective_message.reply_text(
-        f"🔒 *Access Restricted*\n\n"
-        f"Progress: *{joined}/{total}* channels joined\n\n"
-        f"Abhi bhi yeh join karne baaki hain:\n{ch_list}\n\n"
-        "Sab join karne ke baad *Verify* button dabao.",
-        parse_mode="Markdown",
-        reply_markup=join_keyboard(unjoined),
-    )
-
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not CHANNELS:
+        return True # Agar channel setup nahi hai toh bot chalne do
+    
     unjoined = await get_unjoined(update.effective_user.id, context)
     if unjoined:
-        await prompt(update, unjoined)
+        ch_list = "\n".join([f"• {ch['name']}" for ch in unjoined])
+        text = f"❌ **Access Denied!**\n\nAapne hamare channels join nahi kiye hain:\n{ch_list}\n\nNiche diye buttons se join karein aur Verify dabayein."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=join_keyboard(unjoined))
+        else:
+            await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=join_keyboard(unjoined))
         return False
     return True
 
 # ─── HANDLERS ────────────────────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await gate(update, context):
+        await update.message.reply_text(f"👋 Welcome {update.effective_user.first_name}!\n\nBot ab aapke liye active hai.")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await gate(update, context):
-        return
-    user = update.effective_user
-    await update.message.reply_text(
-        f"👋 Welcome, {user.first_name}!\n\n"
-        f"Aapne saare {len(CHANNELS)} channels join kar liye hain.\n"
-        "Ab bot ka full access hai!\n\n"
-        "• /start — Yeh message\n"
-        "• /help  — Help",
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await gate(update, context):
-        return
-    await update.message.reply_text(
-        "🤖 *Help*\n\nApna bot logic yahan likho.",
-        parse_mode="Markdown",
-    )
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await gate(update, context):
-        return
-    # ── Apna bot logic yahan likho ───────────────────────────────────────────
-    await update.message.reply_text(f"Aapne kaha: {update.message.text}")
-
-async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    unjoined = await get_unjoined(query.from_user.id, context)
+    if await gate(update, context):
+        await query.edit_message_text("✅ Verification Successful! Ab aap bot use kar sakte hain.")
 
-    if not unjoined:
-        await query.edit_message_text(
-            f"✅ *Verified!* Welcome, {query.from_user.first_name}!\n\n"
-            f"Saare {len(CHANNELS)} channels join kar liye.\n"
-            "/start dabao.",
-            parse_mode="Markdown",
-        )
-        return
-
-    remaining = len(unjoined)
-    joined    = len(CHANNELS) - remaining
-    ch_list   = "\n".join(f"  ❌  {ch['name']}  ({ch['username']})" for ch in unjoined)
-    await query.edit_message_text(
-        f"⚠️ Abhi bhi *{remaining} channel(s)* baaki hain:\n\n"
-        f"Progress: *{joined}/{len(CHANNELS)}*\n\n"
-        f"{ch_list}\n\n"
-        "Sab join karo phir dobara Verify karo.",
-        parse_mode="Markdown",
-        reply_markup=join_keyboard(unjoined),
-    )
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await gate(update, context):
+        await update.message.reply_text(f"Aapne kaha: {update.message.text}")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
+def main():
+    if not BOT_TOKEN or not WEBHOOK_URL:
+        logger.critical("FATAL ERROR: BOT_TOKEN ya WEBHOOK_URL missing hai!")
+        return
 
-def main() -> None:
-    # Pinger start karo (bot se pehle)
     start_pinger()
-
+    
     app = Application.builder().token(BOT_TOKEN).build()
-
+    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
-    logger.info(f"Bot start — {len(CHANNELS)} channel(s) — self-ping active (har {PING_INTERVAL//60} min)")
+    logger.info("Bot is starting...")
+    
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         webhook_url=f"{WEBHOOK_URL}/webhook",
-        url_path="/webhook",
+        url_path="webhook",
     )
 
 if __name__ == "__main__":
