@@ -117,7 +117,6 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if OWNER_ID:
             try:
                 await update.message.forward(chat_id=OWNER_ID)
-                await update.message.reply_text("✅ Aapka message owner ko forward kar diya gaya hai.")
             except Exception as e:
                 logger.error(f"Forward error: {e}")
                 await update.message.reply_text("❌ Message bhejte waqt kuch galti hui.")
